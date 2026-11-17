@@ -1,0 +1,367 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/gofrs/flock"
+	"github.com/spf13/cobra"
+)
+
+const (
+	minJobs = 1
+	maxJobs = 256
+
+	maxRedirects = 10
+)
+
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := newCommand().ExecuteContext(ctx); err != nil {
+		slog.Error("depot failed", "error", err)
+		os.Exit(1)
+	}
+}
+
+// options holds the command line flags shared by all subcommands.
+type options struct {
+	root        string
+	verbose     bool
+	jobs        int
+	timeout     time.Duration
+	assignments []string
+}
+
+func (o *options) validate() error {
+	if o.jobs < minJobs || o.jobs > maxJobs {
+		return fmt.Errorf("jobs must be between %d and %d", minJobs, maxJobs)
+	}
+
+	if o.timeout <= 0 {
+		return fmt.Errorf("timeout must be positive")
+	}
+
+	return nil
+}
+
+func (o *options) logger(cmd *cobra.Command) *slog.Logger {
+	level := slog.LevelInfo
+	if o.verbose {
+		level = slog.LevelDebug
+	}
+
+	handler := slog.NewTextHandler(cmd.ErrOrStderr(), &slog.HandlerOptions{Level: level})
+	return slog.New(handler)
+}
+
+func newCommand() *cobra.Command {
+	opts := &options{}
+
+	command := &cobra.Command{
+		Use:           "depot",
+		Short:         "Synchronize checksum-pinned workspace artifacts",
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return errors.Join(cmd.Help(), fmt.Errorf("choose configure, validate or sync"))
+		},
+	}
+
+	flags := command.PersistentFlags()
+	flags.StringVar(&opts.root, "root", ".", "Workspace directory containing DEPOT.yaml")
+	flags.BoolVarP(&opts.verbose, "verbose", "v", false, "Enable debug logging")
+	flags.IntVarP(&opts.jobs, "jobs", "j", min(runtime.NumCPU(), 8), "Maximum concurrent artifact downloads")
+	flags.DurationVar(&opts.timeout, "timeout", 5*time.Minute, "Timeout per HTTP download")
+
+	configure := &cobra.Command{
+		Use:   "configure",
+		Short: "Validate manifests and persist condition variables (no downloads)",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return run(cmd, opts, false, runConfigure)
+		},
+	}
+
+	configure.Flags().StringArrayVar(
+		&opts.assignments,
+		"set",
+		nil,
+		"Set NAME=VALUE; repeat for multiple variables (true/false are booleans)",
+	)
+
+	validate := &cobra.Command{
+		Use:   "validate",
+		Short: "Dry run of sync: check manifests, checksums, destinations and cache without writing anything",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return run(cmd, opts, true, runValidate)
+		},
+	}
+
+	validate.Flags().StringArrayVar(
+		&opts.assignments,
+		"set",
+		nil,
+		"Override NAME=VALUE for this run only (not saved); repeat for multiple variables",
+	)
+
+	sync := &cobra.Command{
+		Use:   "sync",
+		Short: "Download, verify and install active artifacts recursively",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return run(cmd, opts, false, runSync)
+		},
+	}
+
+	command.AddCommand(configure, validate, sync)
+	return command
+}
+
+// session is the locked workspace a subcommand operates on.
+type session struct {
+	root      string
+	cacheDir  string
+	statePath string
+	state     *state
+	vars      map[string]any
+	opts      *options
+	log       *slog.Logger
+}
+
+// run opens and locks the workspace, applies --set assignments and then
+// invokes action while holding the workspace lock. A read-only run neither
+// creates cache directories nor takes the lock, so it never writes anything.
+func run(
+	cmd *cobra.Command,
+	opts *options,
+	readOnly bool,
+	action func(context.Context, *session) error,
+) error {
+	if err := opts.validate(); err != nil {
+		return err
+	}
+
+	s := &session{opts: opts, log: opts.logger(cmd)}
+	if err := s.openWorkspace(!readOnly); err != nil {
+		return err
+	}
+
+	if !readOnly {
+		l, err := lock(cmd.Context(), filepath.Join(s.cacheDir, "workspace.lock"))
+		if err != nil {
+			return err
+		}
+
+		defer unlock(l, s.log)
+	}
+
+	if err := s.loadVariables(); err != nil {
+		return err
+	}
+
+	return action(cmd.Context(), s)
+}
+
+func unlock(l *flock.Flock, log *slog.Logger) {
+	if err := l.Unlock(); err != nil {
+		log.Warn("could not release workspace lock", "error", err)
+	}
+}
+
+// openWorkspace resolves the workspace root and, if create is set, creates
+// the depot cache directories. Symlinked path components are always refused.
+func (s *session) openWorkspace(create bool) error {
+	workspace, err := filepath.Abs(s.opts.root)
+	if err != nil {
+		return err
+	}
+
+	workspace, err = filepath.EvalSymlinks(workspace)
+	if err != nil {
+		return err
+	}
+
+	s.root = workspace
+
+	rootManifest := filepath.Join(workspace, manifestName)
+	if err := noSymlinks(workspace, rootManifest); err != nil {
+		return err
+	}
+
+	if _, err := os.Stat(rootManifest); err != nil {
+		return err
+	}
+
+	s.cacheDir = filepath.Join(workspace, ".cache", "depot")
+	s.statePath = filepath.Join(s.cacheDir, "state.json")
+	dirs := []string{
+		s.cacheDir,
+		filepath.Join(s.cacheDir, "locks"),
+		filepath.Join(s.cacheDir, "objects"),
+	}
+
+	for _, dir := range dirs {
+		if err := noSymlinks(workspace, dir); err != nil {
+			return err
+		}
+
+		if !create {
+			continue
+		}
+
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+
+	for _, path := range []string{filepath.Join(s.cacheDir, "workspace.lock"), s.statePath} {
+		if err := noSymlinks(workspace, path); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// loadVariables reads the saved state and merges in --set assignments.
+func (s *session) loadVariables() error {
+	saved, err := readState(s.statePath)
+	if err != nil {
+		return err
+	}
+
+	for _, assignment := range s.opts.assignments {
+		name, value, ok := strings.Cut(assignment, "=")
+		if !ok {
+			return fmt.Errorf("--set expects NAME=VALUE, got %q", assignment)
+		}
+
+		saved.Variables[name] = value
+	}
+
+	vars, err := variables(saved.Variables)
+	if err != nil {
+		return err
+	}
+
+	s.state = saved
+	s.vars = vars
+	return nil
+}
+
+func runConfigure(_ context.Context, s *session) error {
+	g := newGraph(s.root, s.vars, s.state.Variables)
+	active, err := g.load([]string{filepath.Join(s.root, manifestName)})
+	if err != nil {
+		return err
+	}
+
+	for _, a := range active {
+		s.log.Debug("active artifact", "artifact", a.Name, "from", a.From, "to", a.To)
+	}
+
+	for _, name := range missingChecksums(active) {
+		s.log.Warn("artifact has no sha256; sync will refuse to download it until one is added",
+			"artifact", name)
+	}
+
+	if err := g.checkRequired(); err != nil {
+		return err
+	}
+
+	if err := atomicJSON(s.statePath, s.state); err != nil {
+		return err
+	}
+
+	s.log.Info("workspace configured",
+		"variables", len(s.state.Variables),
+		"artifacts", len(g.names))
+	return nil
+}
+
+// runValidate never touches the network, so the engine has no HTTP client.
+func runValidate(ctx context.Context, s *session) error {
+	e := &engine{
+		root:      s.root,
+		statePath: s.statePath,
+		state:     s.state,
+		jobs:      s.opts.jobs,
+		log:       s.log,
+		cache: &cache{
+			dir: s.cacheDir,
+			log: s.log,
+		},
+	}
+
+	return e.validate(ctx, s.vars)
+}
+
+func runSync(ctx context.Context, s *session) error {
+	client, closeClient := newHTTPClient(s.opts.jobs, s.opts.timeout)
+	defer closeClient()
+
+	e := &engine{
+		root:      s.root,
+		statePath: s.statePath,
+		state:     s.state,
+		jobs:      s.opts.jobs,
+		log:       s.log,
+		cache: &cache{
+			dir:    s.cacheDir,
+			client: client,
+			log:    s.log,
+		},
+	}
+
+	return e.sync(ctx, s.vars)
+}
+
+// newHTTPClient returns a client that never transparently decompresses
+// responses (checksums cover the bytes on the wire) and refuses unsafe
+// redirects. The returned function releases idle connections.
+func newHTTPClient(jobs int, timeout time.Duration) (*http.Client, func()) {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DisableCompression = true
+	transport.MaxConnsPerHost = jobs
+
+	client := &http.Client{
+		Transport:     transport,
+		Timeout:       timeout,
+		CheckRedirect: checkRedirect,
+	}
+
+	return client, transport.CloseIdleConnections
+}
+
+func checkRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= maxRedirects {
+		return fmt.Errorf("too many HTTP redirects")
+	}
+
+	if req.URL.Scheme != "https" && req.URL.Scheme != "http" {
+		return fmt.Errorf("redirect to unsupported URL scheme")
+	}
+
+	if req.URL.User != nil {
+		return fmt.Errorf("redirect URL contains credentials")
+	}
+
+	if len(via) > 0 && via[len(via)-1].URL.Scheme == "https" && req.URL.Scheme != "https" {
+		return fmt.Errorf("refusing HTTPS to HTTP redirect")
+	}
+
+	return nil
+}
