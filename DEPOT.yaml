@@ -1,0 +1,47 @@
+includes:
+  # check <DEPOT.yaml>/build for another DEPOT.yaml file
+  - "build"
+
+artifacts:
+  - name: "odin"
+    to: "third_party/odin"
+    from: "https://github.com/odin-lang/Odin/releases/download/dev-2026-11a/odin-linux-amd64-dev-2026-11a.tar.gz"
+    condition: "host_cpu == 'x64'"
+
+  - name: "odin"
+    to: "third_party/odin"
+    from: "https://github.com/odin-lang/Odin/releases/download/dev-2026-11a/odin-linux-arm64-dev-2026-11a.tar.gz"
+    condition: "host_cpu == 'arm64'"
+
+  # only one odin can be true, if both resolve true for some reason that's an error
+
+  - name: "UnicodeData"
+    to: "third_party/unicode/UnicodeData.txt"
+    from: "https://www.unicode.org/Public/UCD/latest/UnicodeData.txt"
+    condition: "use_old_unicode == false"
+
+  - name: "UnicodeData"
+    to: "third_party/unicode/UnicodeData.txt"
+    from: "https://www.unicode.org/Public/UCD/17.0.0/UnicodeData.txt"
+    condition: "use_old_unicode == true"
+
+  # same applies here we can't have both UnicodeData and UnicodeDataOld resolve true at the same time
+  # artifacts are only added to the artifact list if a condition matched. As already explained, if 2 artifacts resolve true with the same name that conflicts and fails
+
+required:
+  # always required artifacts will fail, if not a single condition matched causing their insertion
+  - "UnicodeData"
+
+# After an include or after an artifact has been downloaded, the tool attempts to find more DEPOT.yaml files recursivly.
+# host_os and host_cpu are builtin variables, target_os and target_cpu are also builtins and default to host_*
+# variables can be declared when invoking the `configure` subcommand using the `--set` subcommand following schema: `NAME=VALUE`
+# target_* can be overriden, any variable can be defined but host_* cannot be overridden
+# conditionals allowed are: and, or, not, ==, != and parenthesis
+# depot produces a "depot" folder in a .cache dir which may get shared by other tools such as clangd swo be careful
+# depot puts compressed and raw artifacts into the cache while only putting uncompressed artifacts into the working tree
+# allow to locations to also be archives in this case dont uncompress still produce a cache entry
+# allow a `archive` field on artifacts in case the tool can't figure out what type of compression if any is used to give it a hint
+# for example if the file is a tar but doesnt end in .tar
+# the cache also contains all --set variables similar to `args.gn` from GN so --set doesnt need to provided each time
+# what i forgot the example is that checksum's sha256 are required!!! the tool won't download ANYTHING without a checksum
+# checksums are also stored and compaired for example iof i delete the compressed from but the cached archive still exissts the tool should decompress the archive instead of redownloading
