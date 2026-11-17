@@ -134,13 +134,7 @@ func lock(ctx context.Context, path string) (*flock.Flock, error) {
 	return l, nil
 }
 
-type treeRecord struct {
-	SHA256 string `json:"sha256"`
-	Format string `json:"format"`
-	Tree   string `json:"tree"`
-}
-
-func (c *cache) materialize(ctx context.Context, a artifact) (string, error) {
+func (c *cache) downloadSource(ctx context.Context, a artifact) (string, error) {
 	lockPath := filepath.Join(c.dir, "locks", a.SHA256+".lock")
 	if err := noSymlinks(c.dir, lockPath); err != nil {
 		return "", err
@@ -153,6 +147,10 @@ func (c *cache) materialize(ctx context.Context, a artifact) (string, error) {
 
 	defer l.Unlock()
 
+	if err := c.removeLegacyTrees(a); err != nil {
+		return "", err
+	}
+
 	object := filepath.Join(c.dir, "objects", a.SHA256)
 	if err := os.MkdirAll(object, 0o755); err != nil {
 		return "", err
@@ -163,14 +161,6 @@ func (c *cache) materialize(ctx context.Context, a artifact) (string, error) {
 	}
 
 	source := filepath.Join(object, "source")
-	format, _ := archiveFormat(a)
-	preserve := !unpacks(a, format)
-	tree := filepath.Join(object, "unpacked-"+format)
-	recordPath := tree + ".json"
-	if err := noSymlinks(c.dir, recordPath); err != nil {
-		return "", err
-	}
-
 	if err := noSymlinks(c.dir, source); err != nil {
 		return "", err
 	}
@@ -189,26 +179,6 @@ func (c *cache) materialize(ctx context.Context, a artifact) (string, error) {
 		return "", err
 	}
 
-	if !preserve {
-		data, err := os.ReadFile(recordPath)
-		var record treeRecord
-		if err == nil && json.Unmarshal(data, &record) == nil && record.SHA256 == a.SHA256 && record.Format == format {
-			if err := noSymlinks(c.dir, tree); err != nil {
-				return "", err
-			}
-
-			sum, err := treeChecksum(ctx, tree)
-			if err == nil && sum == record.Tree {
-				c.log.Debug("using verified unpacked cache", "artifact", a.Name)
-				return unpackedPath(tree, format), nil
-			}
-
-			if err := ctx.Err(); err != nil {
-				return "", err
-			}
-		}
-	}
-
 	if !sourceOK {
 		if err := c.download(ctx, a, source); err != nil {
 			return "", err
@@ -217,47 +187,30 @@ func (c *cache) materialize(ctx context.Context, a artifact) (string, error) {
 		c.log.Debug("using verified download cache", "artifact", a.Name)
 	}
 
-	if preserve {
-		return source, nil
+	return source, nil
+}
+
+// removeLegacyTrees drops only the unpacked entries owned by older versions
+// of depot. Callers hold this object's lock.
+func (c *cache) removeLegacyTrees(a artifact) error {
+	object := filepath.Join(c.dir, "objects", a.SHA256)
+
+	for _, format := range []string{"tar", "tar.gz", "tar.bz2", "tar.xz", "zip", "gzip", "xz"} {
+		tree := filepath.Join(object, "unpacked-"+format)
+		if err := noSymlinks(c.dir, tree); err != nil {
+			return err
+		}
+
+		if err := os.RemoveAll(tree); err != nil {
+			return err
+		}
+
+		if err := os.Remove(tree + ".json"); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
 	}
 
-	stage, err := os.MkdirTemp(object, ".extract-*")
-	if err != nil {
-		return "", err
-	}
-
-	defer os.RemoveAll(stage)
-
-	if err := extract(ctx, source, stage, format); err != nil {
-		return "", fmt.Errorf("extract: %w", err)
-	}
-
-	if err := os.Chmod(stage, 0o755); err != nil {
-		return "", err
-	}
-
-	sum, err := treeChecksum(ctx, stage)
-	if err != nil {
-		return "", err
-	}
-
-	if err := noSymlinks(c.dir, tree); err != nil {
-		return "", err
-	}
-
-	if err := os.RemoveAll(tree); err != nil {
-		return "", err
-	}
-
-	if err := os.Rename(stage, tree); err != nil {
-		return "", err
-	}
-
-	if err := atomicJSON(recordPath, treeRecord{a.SHA256, format, sum}); err != nil {
-		return "", err
-	}
-
-	return unpackedPath(tree, format), nil
+	return nil
 }
 
 func unpackedPath(tree, format string) string {

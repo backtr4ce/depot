@@ -73,6 +73,15 @@ func writeManifest(t *testing.T, dir string, m manifest) {
 	writeFile(t, filepath.Join(dir, manifestName), manifestBytes(t, m))
 }
 
+// configure runs depot configure, which sync requires, and fails on error.
+func configure(t *testing.T, root string, args ...string) {
+	t.Helper()
+
+	if err := runCLI(t, root, append([]string{"configure"}, args...)...); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func runCLI(t *testing.T, root string, args ...string) error {
 	t.Helper()
 	cmd := newCommand()
@@ -224,17 +233,12 @@ func TestRecursiveSyncAndOfflineCache(t *testing.T) {
 		t.Fatalf("offline sync: %v", err)
 	}
 
-	source := filepath.Join(root, ".cache", "depot", "objects", digest(bundle), "source")
-	if err := os.Remove(source); err != nil {
-		t.Fatal(err)
-	}
-
 	if err := os.RemoveAll(filepath.Join(root, "tools")); err != nil {
 		t.Fatal(err)
 	}
 
 	if err := runCLI(t, root, "sync"); err != nil {
-		t.Fatalf("restore from unpacked cache without source: %v", err)
+		t.Fatalf("restore from compressed cache: %v", err)
 	}
 
 	if got := readString(t, dest); got != string(leaf) {
@@ -345,6 +349,8 @@ func TestValidationBeforeDownload(t *testing.T) {
 			root := t.TempDir()
 			m := manifest{Artifacts: []artifact{valid}}
 			tt.edit(&m)
+			writeManifest(t, root, manifest{})
+			configure(t, root)
 			writeManifest(t, root, m)
 
 			wantError(t, runCLI(t, root, "sync"), tt.want)
@@ -424,6 +430,8 @@ func TestChecksumFailureAndRecovery(t *testing.T) {
 
 	writeManifest(t, root, m)
 
+	configure(t, root)
+
 	wantError(t, runCLI(t, root, "sync"), "sha256 mismatch")
 	dest := filepath.Join(root, "file.txt")
 	if _, err := os.Stat(dest); !os.IsNotExist(err) {
@@ -438,6 +446,12 @@ func TestChecksumFailureAndRecovery(t *testing.T) {
 
 	cachedSource := filepath.Join(root, ".cache", "depot", "objects", digest(expected), "source")
 	writeFile(t, cachedSource, []byte("cache corruption"))
+
+	// A current destination does not need the cached source. Removing it
+	// forces cache verification and recovery before the next installation.
+	if err := os.Remove(dest); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := runCLI(t, root, "sync"); err != nil {
 		t.Fatal(err)
@@ -482,6 +496,8 @@ func TestConcurrentDownloads(t *testing.T) {
 	}
 
 	writeManifest(t, root, m)
+
+	configure(t, root)
 
 	if err := runCLI(t, root, "sync", "--jobs", "2", "--timeout", "3s"); err != nil {
 		t.Fatalf("downloads were not concurrent: %v", err)
@@ -600,6 +616,8 @@ func TestArchiveHintsAndArchiveDestinations(t *testing.T) {
 
 			writeManifest(t, root, m)
 
+			configure(t, root)
+
 			if err := runCLI(t, root, "sync"); err != nil {
 				t.Fatal(err)
 			}
@@ -634,6 +652,7 @@ func TestUnmanagedAndSymlinkProtection(t *testing.T) {
 			}
 
 			writeManifest(t, root, m)
+			configure(t, root)
 
 			existing := filepath.Join(root, "existing")
 
@@ -658,7 +677,7 @@ func TestUnmanagedAndSymlinkProtection(t *testing.T) {
 }
 
 func TestRepositoryManifest(t *testing.T) {
-	m, err := readManifest(manifestName)
+	m, _, err := readManifest(manifestName)
 	if errors.Is(err, os.ErrNotExist) {
 		t.Skip("no example DEPOT.yaml in the repository")
 	}
@@ -723,7 +742,7 @@ func TestRepositoryManifest(t *testing.T) {
 	}
 }
 
-func TestReextractCorruptCacheOffline(t *testing.T) {
+func TestRemoveLegacyExtractedCache(t *testing.T) {
 	root := t.TempDir()
 	data := tarGzip(t, map[string][]byte{"file.txt": []byte("original")})
 
@@ -746,6 +765,8 @@ func TestReextractCorruptCacheOffline(t *testing.T) {
 
 	writeManifest(t, root, m)
 
+	configure(t, root)
+
 	if err := runCLI(t, root, "sync"); err != nil {
 		t.Fatal(err)
 	}
@@ -754,12 +775,24 @@ func TestReextractCorruptCacheOffline(t *testing.T) {
 	tree := filepath.Join(root, ".cache", "depot", "objects", digest(data), "unpacked-tar.gz")
 	writeFile(t, filepath.Join(tree, "file.txt"), []byte("corruption"))
 
-	if err := runCLI(t, root, "sync"); err != nil {
-		t.Fatalf("could not reextract from compressed cache: %v", err)
+	// Depot versions that extracted into the cache wrote no stamp.
+	statePath := filepath.Join(root, ".cache", "depot", "state.json")
+	saved, err := readState(statePath)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	if got := readString(t, filepath.Join(tree, "file.txt")); got != "original" {
-		t.Fatalf("corrupt unpacked entry not repaired: got %q", got)
+	saved.Stamp = nil
+	if err := atomicJSON(statePath, saved); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runCLI(t, root, "sync"); err != nil {
+		t.Fatalf("could not remove legacy extracted cache: %v", err)
+	}
+
+	if _, err := os.Stat(tree); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy extracted entry was not removed: %v", err)
 	}
 
 	if requests.Load() != 1 {
@@ -902,6 +935,8 @@ func TestHTTPFailuresDoNotReplaceInstalledArtifacts(t *testing.T) {
 			}
 
 			writeManifest(t, root, m)
+
+			configure(t, root)
 
 			if err := runCLI(t, root, "sync"); err != nil {
 				t.Fatal(err)
@@ -1186,6 +1221,8 @@ func TestParentUpdateUsesNewNestedManifest(t *testing.T) {
 
 		writeManifest(t, root, top)
 
+		configure(t, root)
+
 		if err := runCLI(t, root, "sync"); err != nil {
 			t.Fatal(err)
 		}
@@ -1393,6 +1430,8 @@ func TestValidateIsReadOnlyDryRun(t *testing.T) {
 		t.Fatalf("validate performed %d downloads", requests.Load())
 	}
 
+	configure(t, root)
+
 	if err := runCLI(t, root, "sync"); err != nil {
 		t.Fatalf("validate --set must not be persisted: %v", err)
 	}
@@ -1477,6 +1516,8 @@ func TestSyncCreatesMissingParentDirectories(t *testing.T) {
 
 	writeManifest(t, root, top)
 
+	configure(t, root)
+
 	if err := runCLI(t, root, "sync"); err != nil {
 		t.Fatal(err)
 	}
@@ -1519,6 +1560,8 @@ func TestStripPrefix(t *testing.T) {
 	// A doubly nested directory becomes the destination root.
 	writeManifest(t, root, stripPrefixManifest(server.URL, data, "pkg-1.0/inner"))
 
+	configure(t, root)
+
 	if err := runCLI(t, root, "sync"); err != nil {
 		t.Fatal(err)
 	}
@@ -1550,8 +1593,10 @@ func TestStripPrefix(t *testing.T) {
 		t.Fatalf("failed sync changed the installed artifact: %q", got)
 	}
 
-	// The archive is extracted in the cache now, so validate can check it.
-	wantError(t, runCLI(t, root, "validate"), `strip_prefix "pkg-2.0" not found`)
+	// Validation never extracts archives; sync checks that the prefix exists.
+	if err := runCLI(t, root, "validate"); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestInvalidStripPrefix(t *testing.T) {

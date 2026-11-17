@@ -8,12 +8,14 @@ go build -o depot .
 ./depot configure
 ./depot validate
 ./depot sync --jobs 4
+./depot clean
 ```
 
 ## Commands
 
 `configure` validates the root manifest and its existing includes, then saves
-variables without downloading anything. Manifests inside artifact destinations
+variables without downloading anything. It must be run once before `sync` or
+`clean`; it creates `.cache/depot/state.json`. Manifests inside artifact destinations
 are deferred until those artifacts are synchronized. Repeat `--set NAME=VALUE` to set several
 variables. Existing assignments are retained; subsequent invocations need not
 repeat them. Assigning `true` or `false` produces a boolean; all other values are
@@ -32,11 +34,35 @@ lock, or saved state. `validate --set NAME=VALUE` applies to that run only.
 Manifests shipped inside artifacts that are not installed yet can only be
 validated by `sync`.
 
-`sync` uses the saved variables to download and install artifacts. It also works
-without configuring first if conditions use built-in variables or manifest defaults. Existing
+`sync` uses the saved variables to download and install artifacts. It fails
+without creating anything if the workspace has not been configured. Existing
 artifact destinations must either be absent or have been installed by depot;
 unmanaged files and locally modified artifacts are never overwritten. Move such
-destinations aside explicitly to replace them. Inactive artifacts are not pruned.
+destinations aside explicitly to replace them. After the whole graph has
+synchronized, artifacts that are no longer active (removed from a manifest,
+disabled by a condition, or declared by a removed manifest) are deleted and
+dropped from the state. An inactive artifact that was locally modified, or that
+contains an active destination, stops the sync instead.
+
+`sync` evaluates manifests only when needed. A completed sync writes a stamp
+into the state, like ninja's and GN's stamp files: the SHA-256 of every
+evaluated manifest, the manifests found in every searched directory, the
+effective variables and the depot state version. If the stamp still matches and
+every recorded artifact is installed unmodified, `sync` reports `workspace is up
+to date` without evaluating conditions. An edited, added or removed manifest, a
+changed variable, or a missing artifact causes a full evaluation, which
+regenerates the state. The log names the reason. A sync that does not complete
+leaves no stamp, so the next one evaluates again. When the stamp matches, `sync` logs `manifests unchanged since
+last sync; using state instead of evaluating`; `--verbose` also lists each
+artifact verified from the state. `configure` and `validate` always evaluate all
+manifests (`validate` reports whether the stamp is current), and `clean` only
+reads the state.
+
+`clean` is like `gn clean`. It deletes every artifact recorded in the state and
+the downloaded objects. It keeps `state.json` (saved variables), locks and
+`.cache/depot/.gitignore`, so a later `sync` restores everything without another
+`configure`. It checks every artifact before deleting anything and refuses
+if any was locally modified.
 
 All commands accept `--root DIR` (default: current directory), `--verbose`,
 `--jobs` (1-256, a sanity cap on concurrent connections and open files), and `--timeout` (per HTTP download, default: 5 minutes).
@@ -61,6 +87,7 @@ artifacts:
     condition: "host_cpu == 'x64' and not use_old_tool"
     # archive: tar.gz  # Optional format hint for extensionless URLs.
     # strip_prefix: tool-1.2.3/linux  # Optional subpath of the archive to install.
+    # ignore_depot: true  # Never load DEPOT.yaml files shipped in this artifact.
 
 required:
   - tool
@@ -76,12 +103,17 @@ symlink paths, and `.git`/`.cache` destinations are
 rejected. Only HTTP(S) sources are supported; HTTPS redirects cannot downgrade
 to HTTP. No manifest commands or hooks are executed.
 
+Manifests may use `\n`, `\r\n` or `\r` line endings; converting between them
+(e.g. by git's `core.autocrlf`) does not count as a change.
+
 Includes are recursively searched for `DEPOT.yaml`. A missing include is allowed
 so it can be populated later. After each artifact installation, depot recursively
 discovers further manifests in that artifact. Repeated includes and include cycles
 are deduplicated. Artifact names must be globally unique among active definitions;
 mutually exclusive definitions of the same name are supported. Each discovered
 batch must satisfy its `required` names before that batch is downloaded.
+Set `ignore_depot: true` on an artifact to ignore every `DEPOT.yaml` inside it,
+both after installation and when an include searches its directory.
 
 Different artifacts cannot share a destination. Nested destinations are allowed
 for manifests shipped inside an ancestor artifact; the parent must not also ship
@@ -143,22 +175,31 @@ doubly nested archives (`strip_prefix: pkg-1.0/pkg`) or to take just a subtree
 (`strip_prefix: pkg-1.0/bin`). It must be relative and stay inside the archive,
 and it is rejected for raw files, standalone gzip/xz, and archives kept unextracted.
 A prefix missing from the archive fails before anything is installed, listing the
-archive's top-level entries. Changing only `strip_prefix` reinstalls the artifact.
+archive's top-level entries. `validate` cannot detect a missing prefix because it
+never extracts. Changing only `strip_prefix` reinstalls the artifact.
 
 Only `.cache/depot/` is owned by depot; other tools' cache directories are left
 alone. It contains:
 
-- `state.json`: saved variables and managed installation integrity records.
+- `state.json`: saved variables, installation integrity records and the stamp.
 - `objects/<sha256>/source`: original verified downloads, compressed or raw.
-- `objects/<sha256>/unpacked-*`: extracted trees and integrity metadata.
 - `locks/` and `workspace.lock`: cancellable cross-process locks.
+- `.sync-*`: temporary extraction directories, removed when `sync` finishes.
 
-Cached downloads are hashed before reuse. Extracted trees have per-tree integrity
-records, allowing offline restoration even when their original compressed download
-has been removed. Corrupt extracted entries are rebuilt from a verified source;
-only an absent or corrupt necessary source requires another download. Integrity
-checks cover file contents, file permissions, and the root mode, not intermediate
+The cache keeps only the downloaded files, never extracted copies, so nothing is
+stored twice. Archives are extracted into a temporary directory only when their
+artifact must be (re)installed; artifacts that are already current need neither
+the download nor extraction. Extracted trees left in the cache by older depot
+versions are deleted automatically. Cached downloads are hashed before reuse;
+only an absent or corrupt source requires another download. Integrity checks
+cover file contents, file permissions, and the root mode, not intermediate
 directory permissions or empty-directory changes.
+
+On the first writing command depot creates `.cache/depot/.gitignore` containing
+`*`, so its cache is never committed. Nothing is written to `.cache/` itself,
+which is shared with tools such as clangd. An existing `.cache/depot/.gitignore`
+is never changed. An unmodified `.cache/.gitignore` generated by older depot
+versions is removed.
 
 Downloads and extraction use temporary paths; only checksum-verified content can
 be installed. Downloads run in a bounded goroutine pool, cancel on failure or

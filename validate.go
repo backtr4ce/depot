@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -34,6 +33,17 @@ type probe struct {
 // Manifests shipped inside artifacts are only visible once the artifact is
 // installed, so recursion continues only into artifacts that are up to date.
 func (e *engine) validate(ctx context.Context, vars map[string]any) error {
+	reason, err := e.state.Stamp.stale(ctx, e.root, vars, sortedKeys(e.state.Installed))
+	if err != nil {
+		return err
+	}
+
+	if reason == "" {
+		e.log.Info("manifests are unchanged since the last sync")
+	} else {
+		e.log.Info("sync will evaluate manifests", "reason", reason)
+	}
+
 	g := newGraph(e.root, vars, e.state.Variables)
 	paths := []string{filepath.Join(e.root, manifestName)}
 	counts := map[plan]int{}
@@ -68,11 +78,17 @@ func (e *engine) validate(ctx context.Context, vars map[string]any) error {
 			e.log.Info("artifact is valid", "artifact", a.Name, "to", rel, "plan", string(p.plan))
 
 			if p.plan != planCurrent {
-				deferred++
+				if !a.IgnoreDepot {
+					deferred++
+				}
 				continue
 			}
 
-			found, err := discover(a.dest)
+			if a.IgnoreDepot {
+				continue
+			}
+
+			found, err := g.discover(a.dest)
 			if err != nil {
 				return err
 			}
@@ -85,6 +101,15 @@ func (e *engine) validate(ctx context.Context, vars map[string]any) error {
 	if deferred > 0 {
 		e.log.Warn("manifests inside artifacts that are not yet installed are validated during sync",
 			"artifacts", deferred)
+	} else if len(problems) == 0 {
+		obsolete, err := e.obsolete(ctx, g)
+		if err != nil {
+			problems = append(problems, err)
+		} else {
+			for _, rel := range obsolete {
+				e.log.Info("inactive artifact", "to", rel, "plan", "remove")
+			}
+		}
 	}
 
 	if len(problems) > 0 {
@@ -149,18 +174,13 @@ func (e *engine) probe(ctx context.Context, a artifact) (probe, error) {
 	}
 
 	if cached {
-		if err := e.cache.checkStripPrefix(a); err != nil {
-			return probe{problem: err}, nil
-		}
-
 		return probe{plan: planCached}, nil
 	}
 
 	return probe{plan: planDownload}, nil
 }
 
-// has reports whether materialize could serve a without downloading. Unlike
-// materialize it is read-only: it neither takes locks nor repairs the cache.
+// has checks the original download without taking locks or repairing the cache.
 func (c *cache) has(ctx context.Context, a artifact) (bool, error) {
 	object := filepath.Join(c.dir, "objects", a.SHA256)
 	if err := noSymlinks(c.dir, object); err != nil {
@@ -169,71 +189,9 @@ func (c *cache) has(ctx context.Context, a artifact) (bool, error) {
 
 	sum, err := checksum(ctx, filepath.Join(object, "source"))
 
-	switch {
-	case err == nil && sum == a.SHA256:
-		return true, nil
-	case err != nil && !errors.Is(err, os.ErrNotExist):
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return false, err
 	}
 
-	format, err := archiveFormat(a)
-	if err != nil {
-		return false, err
-	}
-
-	if !unpacks(a, format) {
-		// The original download is installed as-is, so only source counts.
-		return false, nil
-	}
-
-	tree := filepath.Join(object, "unpacked-"+format)
-	data, err := os.ReadFile(tree + ".json")
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	}
-
-	if err != nil {
-		return false, err
-	}
-
-	var record treeRecord
-	if json.Unmarshal(data, &record) != nil || record.SHA256 != a.SHA256 || record.Format != format {
-		return false, nil
-	}
-
-	if err := noSymlinks(c.dir, tree); err != nil {
-		return false, err
-	}
-
-	sum, err = treeChecksum(ctx, tree)
-	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return false, ctxErr
-		}
-
-		return false, nil
-	}
-
-	return sum == record.Tree, nil
-}
-
-// checkStripPrefix verifies a's strip_prefix against an already extracted
-// tree. Without one, the prefix can only be checked by sync after extraction.
-func (c *cache) checkStripPrefix(a artifact) error {
-	if a.StripPrefix == "" {
-		return nil
-	}
-
-	format, err := archiveFormat(a)
-	if err != nil {
-		return err
-	}
-
-	tree := filepath.Join(c.dir, "objects", a.SHA256, "unpacked-"+format)
-	if _, err := os.Lstat(tree); err != nil {
-		return nil
-	}
-
-	_, err = stripPrefix(tree, a)
-	return err
+	return err == nil && sum == a.SHA256, nil
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -16,7 +17,10 @@ import (
 	"go.yaml.in/yaml/v3"
 )
 
-const manifestName = "DEPOT.yaml"
+const (
+	manifestName    = "DEPOT.yaml"
+	maxManifestSize = 4 << 20
+)
 
 type manifest struct {
 	Vars      map[string]any `yaml:"vars,omitempty"`
@@ -35,41 +39,64 @@ type artifact struct {
 	// StripPrefix selects a slash-separated subpath of an extracted archive;
 	// only that directory or file is installed at To.
 	StripPrefix string `yaml:"strip_prefix"`
+	IgnoreDepot bool   `yaml:"ignore_depot,omitempty"`
 	dest        string
 	defaults    map[string]any
 }
 
-func readManifest(path string) (manifest, error) {
+// readManifest parses the manifest at path and returns it together with the
+// SHA-256 of the bytes that were parsed.
+func readManifest(path string) (manifest, string, error) {
 	var m manifest
-	f, err := os.Open(path)
+	data, sum, err := readManifestBytes(path)
 	if err != nil {
-		return m, err
-	}
-
-	defer f.Close()
-
-	data, err := io.ReadAll(io.LimitReader(f, (4<<20)+1))
-	if err != nil {
-		return m, err
-	}
-
-	if len(data) > 4<<20 {
-		return m, fmt.Errorf("%s: manifest exceeds 4 MiB", path)
+		return m, "", err
 	}
 
 	d := yaml.NewDecoder(bytes.NewReader(data))
 	d.KnownFields(true)
 
 	if err := d.Decode(&m); err != nil {
-		return m, fmt.Errorf("%s: %w", path, err)
+		return m, "", fmt.Errorf("%s: %w", path, err)
 	}
 
 	var extra any
 	if err := d.Decode(&extra); !errors.Is(err, io.EOF) {
-		return m, fmt.Errorf("%s: expected exactly one YAML document", path)
+		return m, "", fmt.Errorf("%s: expected exactly one YAML document", path)
 	}
 
-	return m, nil
+	return m, sum, nil
+}
+
+// readManifestBytes returns the manifest at path with \r\n and \r line
+// endings converted to \n, and the SHA-256 of the converted bytes. Hashing
+// after conversion keeps the stamp valid when a checkout only changes line
+// endings.
+func readManifestBytes(path string) ([]byte, string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, "", err
+	}
+
+	defer f.Close()
+
+	data, err := io.ReadAll(io.LimitReader(f, maxManifestSize+1))
+	if err != nil {
+		return nil, "", err
+	}
+
+	if len(data) > maxManifestSize {
+		return nil, "", fmt.Errorf("%s: manifest exceeds 4 MiB", path)
+	}
+
+	data = normalizeNewlines(data)
+	sum := sha256.Sum256(data)
+	return data, hex.EncodeToString(sum[:]), nil
+}
+
+func normalizeNewlines(data []byte) []byte {
+	data = bytes.ReplaceAll(data, []byte("\r\n"), []byte("\n"))
+	return bytes.ReplaceAll(data, []byte("\r"), []byte("\n"))
 }
 
 func within(root, path string) bool {
@@ -138,13 +165,25 @@ type graph struct {
 	names     map[string]string
 	targets   map[string]string
 	required  map[string]bool
+	ignored   []string
+	// digests and scans are the inputs of the evaluation; see stamp.
+	digests map[string]string
+	scans   map[string][]string
 }
 
 func newGraph(root string, vars map[string]any, overrides map[string]string) *graph {
 	return &graph{
-		root: root, vars: vars, overrides: overrides,
-		inherited: map[string]inheritance{}, loaded: map[string]map[string]any{},
-		seen: map[string]bool{}, names: map[string]string{}, targets: map[string]string{}, required: map[string]bool{},
+		root:      root,
+		vars:      vars,
+		overrides: overrides,
+		inherited: map[string]inheritance{},
+		loaded:    map[string]map[string]any{},
+		seen:      map[string]bool{},
+		names:     map[string]string{},
+		targets:   map[string]string{},
+		required:  map[string]bool{},
+		digests:   map[string]string{},
+		scans:     map[string][]string{},
 	}
 }
 
@@ -232,6 +271,10 @@ func (g *graph) load(paths []string) ([]artifact, error) {
 		path := filepath.Clean(paths[0])
 		paths = paths[1:]
 
+		if g.ignores(path) {
+			continue
+		}
+
 		if g.seen[path] {
 			continue
 		}
@@ -241,10 +284,12 @@ func (g *graph) load(paths []string) ([]artifact, error) {
 		}
 
 		g.seen[path] = true
-		m, err := readManifest(path)
+		m, sum, err := readManifest(path)
 		if err != nil {
 			return nil, err
 		}
+
+		g.digests[path] = sum
 
 		defaults, vars, err := g.manifestVariables(path, m.Vars)
 		if err != nil {
@@ -277,6 +322,9 @@ func (g *graph) load(paths []string) ([]artifact, error) {
 
 			a.defaults = defaults
 			result = append(result, a)
+			if a.IgnoreDepot {
+				g.ignored = append(g.ignored, a.dest)
+			}
 		}
 
 		for _, include := range m.Includes {
@@ -285,12 +333,16 @@ func (g *graph) load(paths []string) ([]artifact, error) {
 				return nil, fmt.Errorf("%s: include: %w", path, err)
 			}
 
-			found, err := discover(dir)
+			found, err := g.discover(dir)
 			if err != nil {
 				return nil, err
 			}
 
 			for _, candidate := range found {
+				if g.ignores(candidate) {
+					continue
+				}
+
 				pending := false
 				for _, a := range result {
 					if within(a.dest, candidate) {
@@ -310,6 +362,16 @@ func (g *graph) load(paths []string) ([]artifact, error) {
 	}
 
 	return result, nil
+}
+
+func (g *graph) ignores(path string) bool {
+	for _, dest := range g.ignored {
+		if within(dest, path) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (g *graph) add(a *artifact, path string) error {
@@ -405,6 +467,17 @@ func (g *graph) checkRequired() error {
 	}
 
 	return nil
+}
+
+// discover searches dir and records the result as an input of the graph.
+func (g *graph) discover(dir string) ([]string, error) {
+	found, err := discover(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	g.scans[filepath.Clean(dir)] = found
+	return found, nil
 }
 
 func discover(dir string) ([]string, error) {

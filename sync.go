@@ -18,17 +18,29 @@ import (
 type installation struct {
 	SHA256      string `json:"sha256"`
 	StripPrefix string `json:"strip_prefix,omitempty"`
+	Format      string `json:"format,omitempty"`
 	Tree        string `json:"tree"`
 }
 
 // current reports whether the record describes the installed form of a.
 func (i installation) current(a artifact) bool {
-	return i.SHA256 == a.SHA256 && i.StripPrefix == a.StripPrefix
+	return i.SHA256 == a.SHA256 && i.StripPrefix == a.StripPrefix && i.Format == installedFormat(a)
+}
+
+func installedFormat(a artifact) string {
+	format, _ := archiveFormat(a)
+	if !unpacks(a, format) {
+		return "none"
+	}
+
+	return format
 }
 
 type state struct {
 	Variables map[string]string       `json:"variables"`
 	Installed map[string]installation `json:"installed"`
+	// Stamp is only set after a sync completed; see stamp.
+	Stamp *stamp `json:"stamp,omitempty"`
 }
 
 func readState(path string) (*state, error) {
@@ -65,6 +77,26 @@ type engine struct {
 }
 
 func (e *engine) sync(ctx context.Context, vars map[string]any) error {
+	current, err := e.upToDate(ctx, vars)
+	if err != nil {
+		return err
+	}
+
+	if current {
+		e.log.Info("workspace is up to date", "artifacts", len(e.state.Installed))
+		return nil
+	}
+
+	// Until the new evaluation completes, state.json no longer describes the
+	// active artifacts; every state write below persists that.
+	e.state.Stamp = nil
+
+	stage, err := os.MkdirTemp(e.cache.dir, ".sync-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(stage)
+
 	g := newGraph(e.root, vars, e.state.Variables)
 	paths := []string{filepath.Join(e.root, manifestName)}
 
@@ -88,18 +120,24 @@ func (e *engine) sync(ctx context.Context, vars map[string]any) error {
 			}
 		}
 
-		sources, err := e.prepare(ctx, batch)
+		sources, err := e.prepare(ctx, batch, stage)
 		if err != nil {
 			return err
 		}
 
 		paths = nil
 		for i, a := range batch {
-			if err := e.install(ctx, a, sources[i]); err != nil {
-				return fmt.Errorf("install %q: %w", a.Name, err)
+			if sources[i] != "" {
+				if err := e.install(ctx, a, sources[i]); err != nil {
+					return fmt.Errorf("install %q: %w", a.Name, err)
+				}
 			}
 
-			found, err := discover(a.dest)
+			if a.IgnoreDepot {
+				continue
+			}
+
+			found, err := g.discover(a.dest)
 			if err != nil {
 				return err
 			}
@@ -113,11 +151,75 @@ func (e *engine) sync(ctx context.Context, vars map[string]any) error {
 		return err
 	}
 
+	obsolete, err := e.obsolete(ctx, g)
+	if err != nil {
+		return err
+	}
+
+	for _, rel := range obsolete {
+		if err := e.retire(ctx, rel); err != nil {
+			return err
+		}
+	}
+
+	e.state.Stamp, err = newStamp(g)
+	if err != nil {
+		return err
+	}
+
+	if err := atomicJSON(e.statePath, e.state); err != nil {
+		e.state.Stamp = nil
+		return err
+	}
+
 	e.log.Info("workspace synchronized", "artifacts", len(g.names))
 	return nil
 }
 
-func (e *engine) prepare(ctx context.Context, batch []artifact) ([]string, error) {
+// upToDate reports whether the stamp shows that no manifest needs evaluating
+// and every recorded artifact is still installed unmodified.
+func (e *engine) upToDate(ctx context.Context, vars map[string]any) (bool, error) {
+	installed := sortedKeys(e.state.Installed)
+	reason, err := e.state.Stamp.stale(ctx, e.root, vars, installed)
+	if err != nil {
+		return false, err
+	}
+
+	if reason != "" {
+		e.log.Info("evaluating manifests", "reason", reason)
+		return false, nil
+	}
+
+	statePath, _ := filepath.Rel(e.root, e.statePath)
+	e.log.Info("manifests unchanged since last sync; using state instead of evaluating",
+		"state", filepath.ToSlash(statePath),
+		"manifests", len(e.state.Stamp.Manifests),
+		"artifacts", len(installed))
+
+	for _, rel := range installed {
+		dest, err := workspacePath(e.root, rel)
+		if err != nil {
+			return false, err
+		}
+
+		if _, err := os.Lstat(dest); errors.Is(err, os.ErrNotExist) {
+			e.log.Info("evaluating manifests", "reason", fmt.Sprintf("%s is missing", rel))
+			return false, nil
+		} else if err != nil {
+			return false, err
+		}
+
+		if err := e.checkRecorded(ctx, dest); err != nil {
+			return false, err
+		}
+
+		e.log.Debug("verified installed artifact from state", "to", rel)
+	}
+
+	return true, nil
+}
+
+func (e *engine) prepare(ctx context.Context, batch []artifact, stage string) ([]string, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -130,11 +232,7 @@ func (e *engine) prepare(ctx context.Context, batch []artifact) ([]string, error
 	for range workers {
 		wg.Go(func() {
 			for i := range work {
-				source, err := e.cache.materialize(ctx, batch[i])
-				if err == nil {
-					source, err = stripPrefix(source, batch[i])
-				}
-
+				source, err := e.prepareArtifact(ctx, batch[i], stage)
 				if err != nil {
 					once.Do(func() {
 						failure = fmt.Errorf("artifact %q: %w", batch[i].Name, err)
@@ -166,6 +264,55 @@ send:
 	}
 
 	return sources, ctx.Err()
+}
+
+// prepareArtifact skips verified current installations. Otherwise it downloads
+// the original bytes and extracts into temporary storage owned by this sync.
+func (e *engine) prepareArtifact(ctx context.Context, a artifact, stage string) (string, error) {
+	rel, _ := filepath.Rel(e.root, a.dest)
+	if record, ok := e.state.Installed[rel]; ok && record.current(a) {
+		if _, err := os.Lstat(a.dest); err == nil {
+			lockPath := filepath.Join(e.cache.dir, "locks", a.SHA256+".lock")
+			if err := noSymlinks(e.cache.dir, lockPath); err != nil {
+				return "", err
+			}
+
+			l, err := lock(ctx, lockPath)
+			if err != nil {
+				return "", err
+			}
+			defer l.Unlock()
+
+			return "", e.cache.removeLegacyTrees(a)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+	}
+
+	source, err := e.cache.downloadSource(ctx, a)
+	if err != nil {
+		return "", err
+	}
+
+	format := installedFormat(a)
+	if format == "none" {
+		return source, nil
+	}
+
+	tree, err := os.MkdirTemp(stage, "extract-*")
+	if err != nil {
+		return "", err
+	}
+
+	if err := extract(ctx, source, tree, format); err != nil {
+		return "", fmt.Errorf("extract: %w", err)
+	}
+
+	if err := os.Chmod(tree, 0o755); err != nil {
+		return "", err
+	}
+
+	return stripPrefix(unpackedPath(tree, format), a)
 }
 
 func (e *engine) checkDestination(ctx context.Context, a artifact) error {
@@ -373,6 +520,7 @@ func (e *engine) install(ctx context.Context, a artifact, source string) error {
 	e.state.Installed[rel] = installation{
 		SHA256:      a.SHA256,
 		StripPrefix: a.StripPrefix,
+		Format:      installedFormat(a),
 		Tree:        sum,
 	}
 
