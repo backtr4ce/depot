@@ -59,7 +59,7 @@ manifests (`validate` reports whether the stamp is current), and `clean` only
 reads the state.
 
 `clean` is like `gn clean`. It deletes every artifact recorded in the state and
-the downloaded objects. It keeps `state.json` (saved variables), locks and
+the downloaded objects. It keeps `state.json` (saved variables), `workspace.lock` and
 `.cache/depot/.gitignore`, so a later `sync` restores everything without another
 `configure`. It checks every artifact before deleting anything and refuses
 if any was locally modified.
@@ -183,7 +183,9 @@ alone. It contains:
 
 - `state.json`: saved variables, installation integrity records and the stamp.
 - `objects/<sha256>/source`: original verified downloads, compressed or raw.
-- `locks/` and `workspace.lock`: cancellable cross-process locks.
+- `workspace.lock`: a cancellable lock held by `configure`, `sync` and `clean`,
+  so concurrent depot processes wait for each other. Goroutines of one sync
+  that share a download use an in-memory lock.
 - `.sync-*`: temporary extraction directories, removed when `sync` finishes.
 
 The cache keeps only the downloaded files, never extracted copies, so nothing is

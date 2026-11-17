@@ -272,16 +272,7 @@ func (e *engine) prepareArtifact(ctx context.Context, a artifact, stage string) 
 	rel, _ := filepath.Rel(e.root, a.dest)
 	if record, ok := e.state.Installed[rel]; ok && record.current(a) {
 		if _, err := os.Lstat(a.dest); err == nil {
-			lockPath := filepath.Join(e.cache.dir, "locks", a.SHA256+".lock")
-			if err := noSymlinks(e.cache.dir, lockPath); err != nil {
-				return "", err
-			}
-
-			l, err := lock(ctx, lockPath)
-			if err != nil {
-				return "", err
-			}
-			defer l.Unlock()
+			defer e.cache.lockObject(a.SHA256)()
 
 			return "", e.cache.removeLegacyTrees(a)
 		} else if !errors.Is(err, os.ErrNotExist) {

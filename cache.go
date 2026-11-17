@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -24,6 +25,30 @@ type cache struct {
 	dir    string
 	client *http.Client
 	log    *slog.Logger
+
+	// The workspace lock keeps other processes out, so objects only
+	// serializes goroutines of this process that share a checksum.
+	mu      sync.Mutex
+	objects map[string]*sync.Mutex
+}
+
+// lockObject serializes access to one cached object and returns its unlock.
+func (c *cache) lockObject(sha string) func() {
+	c.mu.Lock()
+	if c.objects == nil {
+		c.objects = map[string]*sync.Mutex{}
+	}
+
+	m, ok := c.objects[sha]
+	if !ok {
+		m = &sync.Mutex{}
+		c.objects[sha] = m
+	}
+
+	c.mu.Unlock()
+
+	m.Lock()
+	return m.Unlock
 }
 
 func checksum(ctx context.Context, path string) (string, error) {
@@ -135,17 +160,7 @@ func lock(ctx context.Context, path string) (*flock.Flock, error) {
 }
 
 func (c *cache) downloadSource(ctx context.Context, a artifact) (string, error) {
-	lockPath := filepath.Join(c.dir, "locks", a.SHA256+".lock")
-	if err := noSymlinks(c.dir, lockPath); err != nil {
-		return "", err
-	}
-
-	l, err := lock(ctx, lockPath)
-	if err != nil {
-		return "", err
-	}
-
-	defer l.Unlock()
+	defer c.lockObject(a.SHA256)()
 
 	if err := c.removeLegacyTrees(a); err != nil {
 		return "", err

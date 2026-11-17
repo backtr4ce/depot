@@ -199,6 +199,10 @@ func run(
 		}
 
 		defer unlock(l, s.log)
+
+		if err := s.removeLegacyLocks(); err != nil {
+			return err
+		}
 	}
 
 	if m == writeMode {
@@ -221,6 +225,17 @@ func (s *session) checkConfigured() error {
 	}
 
 	return err
+}
+
+// removeLegacyLocks deletes the per-download lock files of older depot
+// versions. The caller holds the workspace lock, which they also took.
+func (s *session) removeLegacyLocks() error {
+	dir := filepath.Join(s.cacheDir, "locks")
+	if err := noSymlinks(s.root, dir); err != nil {
+		return err
+	}
+
+	return os.RemoveAll(dir)
 }
 
 func unlock(l *flock.Flock, log *slog.Logger) {
@@ -257,7 +272,6 @@ func (s *session) openWorkspace(create bool) error {
 	s.statePath = filepath.Join(s.cacheDir, "state.json")
 	dirs := []string{
 		s.cacheDir,
-		filepath.Join(s.cacheDir, "locks"),
 		filepath.Join(s.cacheDir, "objects"),
 	}
 
