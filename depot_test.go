@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/ulikunitz/xz"
 	"go.yaml.in/yaml/v3"
 )
@@ -511,8 +512,12 @@ func TestUnsafeArchives(t *testing.T) {
 	}{
 		{name: "../escape", kind: tar.TypeReg},
 		{name: "/absolute", kind: tar.TypeReg},
-		{name: `dir\escape`, kind: tar.TypeReg},
-		{name: "link", kind: tar.TypeSymlink},
+		{name: `..\escape`, kind: tar.TypeReg},
+		{name: `dir\..\..\escape`, kind: tar.TypeReg},
+		{name: `\absolute`, kind: tar.TypeReg},
+		{name: `\\server\share`, kind: tar.TypeReg},
+		{name: `C:\absolute`, kind: tar.TypeReg},
+		{name: `C:relative`, kind: tar.TypeReg},
 		{name: "hardlink", kind: tar.TypeLink},
 		{name: "device", kind: tar.TypeChar},
 	}
@@ -551,27 +556,67 @@ func TestUnsafeArchives(t *testing.T) {
 		})
 	}
 
-	t.Run("zip traversal", func(t *testing.T) {
-		root := t.TempDir()
+	for _, name := range []string{
+		"../escape",
+		`..\escape`,
+		`dir\..\..\escape`,
+		`\absolute`,
+		`\\server\share`,
+		`C:\absolute`,
+		`C:relative`,
+	} {
+		t.Run("zip "+name, func(t *testing.T) {
+			t.Setenv("GODEBUG", "zipinsecurepath=0")
+			root := t.TempDir()
 
+			var data bytes.Buffer
+			zw := zip.NewWriter(&data)
+			f, err := zw.Create(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			f.Write([]byte("bad"))
+
+			if err := zw.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			source := filepath.Join(root, "source.zip")
+			writeFile(t, source, data.Bytes())
+			dest := filepath.Join(root, "out")
+			if err := os.Mkdir(dest, 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := extract(context.Background(), source, dest, "zip"); err == nil {
+				t.Fatal("unsafe zip accepted")
+			}
+		})
+	}
+
+	t.Run("zip device with backslash", func(t *testing.T) {
+		root := t.TempDir()
 		var data bytes.Buffer
 		zw := zip.NewWriter(&data)
-		f, err := zw.Create("../escape")
-		if err != nil {
+		header := &zip.FileHeader{Name: `device\`}
+		header.SetMode(os.ModeDevice | os.ModeCharDevice | 0o600)
+		if _, err := zw.CreateHeader(header); err != nil {
 			t.Fatal(err)
 		}
-
-		f.Write([]byte("bad"))
-
 		if err := zw.Close(); err != nil {
 			t.Fatal(err)
 		}
 
 		source := filepath.Join(root, "source.zip")
 		writeFile(t, source, data.Bytes())
+		dest := filepath.Join(root, "out")
+		if err := os.Mkdir(dest, 0o755); err != nil {
+			t.Fatal(err)
+		}
 
-		if err := extract(context.Background(), source, filepath.Join(root, "out"), "zip"); err == nil {
-			t.Fatal("unsafe zip accepted")
+		if err := extract(context.Background(), source, dest, "zip"); err == nil {
+			t.Fatal("zip device accepted")
 		}
 	})
 
@@ -586,6 +631,716 @@ func TestUnsafeArchives(t *testing.T) {
 			t.Fatal("expansion limit was ignored")
 		}
 	})
+}
+
+func TestBackslashArchivePaths(t *testing.T) {
+	tests := []struct {
+		name   string
+		format string
+		build  func(*testing.T) []byte
+	}{
+		{
+			name:   "tar",
+			format: "tar.gz",
+			build: func(t *testing.T) []byte {
+				return tarGzip(t, map[string][]byte{`pkg\bin\tool`: []byte("tool")})
+			},
+		},
+		{
+			name:   "zip",
+			format: "zip",
+			build: func(t *testing.T) []byte {
+				var data bytes.Buffer
+				zw := zip.NewWriter(&data)
+				for _, name := range []string{`pkg\`, `pkg\bin\`} {
+					if _, err := zw.Create(name); err != nil {
+						t.Fatal(err)
+					}
+				}
+				w, err := zw.Create(`pkg\bin\tool`)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := w.Write([]byte("tool")); err != nil {
+					t.Fatal(err)
+				}
+				if err := zw.Close(); err != nil {
+					t.Fatal(err)
+				}
+
+				return data.Bytes()
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Depot validates archive paths itself even when Go's zip reader is strict.
+			t.Setenv("GODEBUG", "zipinsecurepath=0")
+			root := t.TempDir()
+			source := filepath.Join(root, "archive")
+			writeFile(t, source, tt.build(t))
+			dest := filepath.Join(root, "out")
+			if err := os.Mkdir(dest, 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := extract(context.Background(), source, dest, tt.format); err != nil {
+				t.Fatal(err)
+			}
+			if got := readString(t, filepath.Join(dest, "pkg", "bin", "tool")); got != "tool" {
+				t.Fatalf("extracted tool = %q, want tool", got)
+			}
+		})
+	}
+}
+
+func TestBackslashManifestPaths(t *testing.T) {
+	root := t.TempDir()
+	data := tarGzip(t, map[string][]byte{"pkg/inner/bin/tool": []byte("tool")})
+	server := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write(data)
+	})
+
+	writeManifest(t, root, manifest{
+		Includes: []string{`build\configs`},
+		Required: []string{"bundle"},
+	})
+	writeManifest(t, filepath.Join(root, "build", "configs"), manifest{
+		Artifacts: []artifact{{
+			Name:        "bundle",
+			To:          `third_party\sdk`,
+			From:        server.URL + "/bundle.tar.gz",
+			SHA256:      digest(data),
+			StripPrefix: `pkg\inner`,
+		}},
+	})
+
+	configure(t, root)
+	if err := runCLI(t, root, "sync"); err != nil {
+		t.Fatal(err)
+	}
+	if got := readString(t, filepath.Join(root, "third_party", "sdk", "bin", "tool")); got != "tool" {
+		t.Fatalf("installed tool = %q, want tool", got)
+	}
+	if err := runCLI(t, root, "sync"); err != nil {
+		t.Fatalf("unchanged sync: %v", err)
+	}
+	if err := runCLI(t, root, "clean"); err != nil {
+		t.Fatalf("clean: %v", err)
+	}
+}
+
+func TestBackslashManifestPathStateMigration(t *testing.T) {
+	if filepath.Separator == '\\' {
+		t.Skip("backslashes are not literal file-name characters on Windows")
+	}
+
+	root := t.TempDir()
+	data := []byte("dependency")
+	server := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write(data)
+	})
+	legacyRel := `third_party\dependency`
+	writeManifest(t, root, manifest{Artifacts: []artifact{{
+		Name:   "dependency",
+		To:     legacyRel,
+		From:   server.URL + "/dependency",
+		SHA256: digest(data),
+	}}})
+	configure(t, root)
+
+	legacyPath := filepath.Join(root, legacyRel)
+	writeFile(t, legacyPath, data)
+	sum, err := treeChecksum(context.Background(), legacyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	statePath := filepath.Join(root, ".cache", "depot", "state.json")
+	saved, err := readState(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved.Installed[legacyRel] = installation{
+		SHA256: digest(data),
+		Format: "none",
+		Tree:   sum,
+	}
+	saved.Stamp = &stamp{Version: stampVersion - 1}
+	if err := atomicJSON(statePath, saved); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runCLI(t, root, "sync"); err != nil {
+		t.Fatal(err)
+	}
+	if got := readString(t, filepath.Join(root, "third_party", "dependency")); got != string(data) {
+		t.Fatalf("migrated dependency = %q, want %q", got, data)
+	}
+	if _, err := os.Lstat(legacyPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy installation was not retired: %v", err)
+	}
+}
+
+func TestUnsafeBackslashManifestPaths(t *testing.T) {
+	paths := []string{
+		`..\outside`,
+		`dir\..\..\outside`,
+		`\absolute`,
+		`\\server\share`,
+		`C:\absolute`,
+		`C:relative`,
+	}
+
+	for _, field := range []string{"include", "to", "strip_prefix"} {
+		for _, path := range paths {
+			t.Run(field+"/"+path, func(t *testing.T) {
+				root := t.TempDir()
+				m := manifest{Artifacts: []artifact{{
+					Name:   "bundle",
+					To:     "tools",
+					From:   "https://example.test/bundle.tar.gz",
+					SHA256: zeroSHA256,
+				}}}
+
+				switch field {
+				case "include":
+					m.Includes = []string{path}
+				case "to":
+					m.Artifacts[0].To = path
+				case "strip_prefix":
+					m.Artifacts[0].StripPrefix = path
+				}
+
+				writeManifest(t, root, m)
+				if err := runCLI(t, root, "configure"); err == nil {
+					t.Fatalf("%s path %q was accepted", field, path)
+				}
+			})
+		}
+	}
+}
+
+func TestReservedBackslashPaths(t *testing.T) {
+	root := t.TempDir()
+	for _, path := range []string{`.cache\depot\item`, `.git\item`} {
+		if _, err := manifestWorkspacePath(root, path); err == nil {
+			t.Errorf("reserved path %q was accepted", path)
+		}
+	}
+
+	_, err := manifestWorkspacePath(root, `.CACHE\item`)
+	if filepath.Separator == '\\' && err == nil {
+		t.Fatal("case-insensitive reserved path was accepted")
+	}
+	if filepath.Separator != '\\' && err != nil {
+		t.Fatalf("case-sensitive path was rejected: %v", err)
+	}
+	if filepath.Separator != '\\' {
+		if _, err := manifestWorkspacePath(root, "dir/name:variant"); err != nil {
+			t.Fatalf("valid Unix filename was rejected: %v", err)
+		}
+	}
+
+	writeManifest(t, filepath.Join(root, ".CACHE"), manifest{})
+	found, err := discover(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Separator == '\\' && len(found) != 0 {
+		t.Fatalf("discovered manifest in case-insensitive reserved directory: %v", found)
+	}
+	if filepath.Separator != '\\' && len(found) != 1 {
+		t.Fatalf("did not discover manifest in case-sensitive directory: %v", found)
+	}
+}
+
+func TestArchiveSymlinks(t *testing.T) {
+	tests := []struct {
+		name   string
+		format string
+		build  func(*testing.T) []byte
+	}{
+		{
+			name:   "tar",
+			format: "tar",
+			build: func(t *testing.T) []byte {
+				var data bytes.Buffer
+				tw := tar.NewWriter(&data)
+				entries := []tar.Header{
+					{Name: "libglfw.so.3.4", Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len("library"))},
+					{Name: "libglfw.so.3", Typeflag: tar.TypeSymlink, Linkname: "libglfw.so.3.4", Mode: 0o777},
+					{Name: "libglfw.so", Typeflag: tar.TypeSymlink, Linkname: "libglfw.so.3", Mode: 0o777},
+					{Name: "optional", Typeflag: tar.TypeSymlink, Linkname: "not-installed", Mode: 0o777},
+				}
+				for _, header := range entries {
+					if err := tw.WriteHeader(&header); err != nil {
+						t.Fatal(err)
+					}
+
+					if header.Typeflag == tar.TypeReg {
+						if _, err := tw.Write([]byte("library")); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+
+				if err := tw.Close(); err != nil {
+					t.Fatal(err)
+				}
+
+				return data.Bytes()
+			},
+		},
+		{
+			name:   "zip",
+			format: "zip",
+			build: func(t *testing.T) []byte {
+				var data bytes.Buffer
+				zw := zip.NewWriter(&data)
+				files := map[string]string{
+					"libglfw.so.3.4": "library",
+					"libglfw.so.3":   "libglfw.so.3.4",
+					"libglfw.so":     "libglfw.so.3",
+					"optional":       "not-installed",
+				}
+				for name, contents := range files {
+					header := &zip.FileHeader{Name: name}
+					if name == "libglfw.so.3.4" {
+						header.SetMode(0o644)
+					} else {
+						header.SetMode(os.ModeSymlink | 0o777)
+					}
+
+					w, err := zw.CreateHeader(header)
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					if _, err := w.Write([]byte(contents)); err != nil {
+						t.Fatal(err)
+					}
+				}
+
+				if err := zw.Close(); err != nil {
+					t.Fatal(err)
+				}
+
+				return data.Bytes()
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			source := filepath.Join(root, "source")
+			writeFile(t, source, tt.build(t))
+
+			dest := filepath.Join(root, "out")
+			if err := os.Mkdir(dest, 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := extract(context.Background(), source, dest, tt.format); err != nil {
+				t.Fatal(err)
+			}
+
+			for name, target := range map[string]string{
+				"libglfw.so":   "libglfw.so.3",
+				"libglfw.so.3": "libglfw.so.3.4",
+				"optional":     "not-installed",
+			} {
+				got, err := os.Readlink(filepath.Join(dest, name))
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				if got != target {
+					t.Errorf("%s target = %q, want %q", name, got, target)
+				}
+			}
+
+			if got := readString(t, filepath.Join(dest, "libglfw.so")); got != "library" {
+				t.Fatalf("read through symlink = %q, want library", got)
+			}
+
+			if _, err := os.Lstat(filepath.Join(dest, "optional")); err != nil {
+				t.Fatalf("contained dangling symlink missing: %v", err)
+			}
+			if _, err := os.Stat(filepath.Join(dest, "optional")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("dangling symlink target stat error = %v, want not-exist", err)
+			}
+
+			sum, err := treeChecksum(context.Background(), dest)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			copied := filepath.Join(root, "copied")
+			if err := copyTree(context.Background(), dest, copied); err != nil {
+				t.Fatal(err)
+			}
+
+			copiedSum, err := treeChecksum(context.Background(), copied)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if copiedSum != sum {
+				t.Fatalf("copied tree checksum = %s, want %s", copiedSum, sum)
+			}
+		})
+	}
+}
+
+func TestBackslashArchiveSymlinks(t *testing.T) {
+	for _, format := range []string{"tar", "zip"} {
+		t.Run(format, func(t *testing.T) {
+			t.Setenv("GODEBUG", "zipinsecurepath=0")
+			root := t.TempDir()
+			var data bytes.Buffer
+			entries := []struct {
+				name    string
+				content string
+				symlink bool
+			}{
+				{name: `real\file`, content: "data"},
+				{name: `lib\link`, content: `..\real\file`, symlink: true},
+				{name: `alias\chain`, content: `..\lib\link`, symlink: true},
+			}
+
+			if format == "tar" {
+				tw := tar.NewWriter(&data)
+				for _, entry := range entries {
+					header := &tar.Header{Name: entry.name, Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len(entry.content))}
+					if entry.symlink {
+						header.Typeflag = tar.TypeSymlink
+						header.Linkname = entry.content
+						header.Size = 0
+					}
+					if err := tw.WriteHeader(header); err != nil {
+						t.Fatal(err)
+					}
+					if !entry.symlink {
+						if _, err := tw.Write([]byte(entry.content)); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+				if err := tw.Close(); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				zw := zip.NewWriter(&data)
+				for _, entry := range entries {
+					header := &zip.FileHeader{Name: entry.name}
+					if entry.symlink {
+						header.SetMode(os.ModeSymlink | 0o777)
+					} else {
+						header.SetMode(0o644)
+					}
+					w, err := zw.CreateHeader(header)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, err := w.Write([]byte(entry.content)); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := zw.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			source := filepath.Join(root, "archive")
+			writeFile(t, source, data.Bytes())
+			dest := filepath.Join(root, "out")
+			if err := os.Mkdir(dest, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := extract(context.Background(), source, dest, format); err != nil {
+				t.Fatal(err)
+			}
+
+			link := filepath.Join(dest, "lib", "link")
+			target, err := os.Readlink(link)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := filepath.ToSlash(target); got != "../real/file" {
+				t.Fatalf("link target = %q, want ../real/file", got)
+			}
+			if got := readString(t, filepath.Join(dest, "alias", "chain")); got != "data" {
+				t.Fatalf("symlink chain = %q, want data", got)
+			}
+			sum, err := treeChecksum(context.Background(), dest)
+			if err != nil {
+				t.Fatalf("checksum links: %v", err)
+			}
+			copied := filepath.Join(root, "copy")
+			if err := copyTree(context.Background(), dest, copied); err != nil {
+				t.Fatalf("copy links: %v", err)
+			}
+			copiedSum, err := treeChecksum(context.Background(), copied)
+			if err != nil || copiedSum != sum {
+				t.Fatalf("copied checksum = %q, %v; want %q", copiedSum, err, sum)
+			}
+		})
+	}
+}
+
+func TestWindowsNativeSymlinkTarget(t *testing.T) {
+	if filepath.Separator != '\\' {
+		t.Skip("requires Windows")
+	}
+
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "real", "file"), []byte("data"))
+	if err := os.Mkdir(filepath.Join(root, "lib"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(`..\real\file`, filepath.Join(root, "lib", "link")); err != nil {
+		t.Skipf("symlink creation unavailable: %v", err)
+	}
+
+	sum, err := treeChecksum(context.Background(), root)
+	if err != nil {
+		t.Fatalf("checksum Windows symlink: %v", err)
+	}
+	copy := filepath.Join(t.TempDir(), "copy")
+	if err := copyTree(context.Background(), root, copy); err != nil {
+		t.Fatalf("copy Windows symlink: %v", err)
+	}
+	copiedSum, err := treeChecksum(context.Background(), copy)
+	if err != nil || copiedSum != sum {
+		t.Fatalf("copied checksum = %q, %v; want %q", copiedSum, err, sum)
+	}
+}
+
+func TestSyncPreservesContainedSymlinks(t *testing.T) {
+	root := t.TempDir()
+	var data bytes.Buffer
+	gz := gzip.NewWriter(&data)
+	tw := tar.NewWriter(gz)
+	entries := []tar.Header{
+		{Name: "pkg/libglfw.so.3.4", Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len("library"))},
+		{Name: "pkg/libglfw.so.3", Typeflag: tar.TypeSymlink, Linkname: "libglfw.so.3.4", Mode: 0o777},
+		{Name: "pkg/libglfw.so", Typeflag: tar.TypeSymlink, Linkname: "libglfw.so.3", Mode: 0o777},
+	}
+	for _, header := range entries {
+		if err := tw.WriteHeader(&header); err != nil {
+			t.Fatal(err)
+		}
+		if header.Typeflag == tar.TypeReg {
+			if _, err := tw.Write([]byte("library")); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	server := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(data.Bytes())
+	})
+	writeManifest(t, root, stripPrefixManifest(server.URL, data.Bytes(), "pkg"))
+	configure(t, root)
+	if err := runCLI(t, root, "sync"); err != nil {
+		t.Fatal(err)
+	}
+
+	link := filepath.Join(root, "tools", "libglfw.so")
+	if got, err := os.Readlink(link); err != nil || got != "libglfw.so.3" {
+		t.Fatalf("installed link = %q, %v; want libglfw.so.3", got, err)
+	}
+	if got := readString(t, link); got != "library" {
+		t.Fatalf("installed library = %q, want library", got)
+	}
+
+	if err := runCLI(t, root, "sync"); err != nil {
+		t.Fatalf("unchanged symlink artifact was not accepted: %v", err)
+	}
+
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("libglfw.so.3.4", link); err != nil {
+		t.Fatal(err)
+	}
+	wantError(t, runCLI(t, root, "sync"), "locally modified")
+}
+
+func TestUnsafeArchiveSymlinks(t *testing.T) {
+	tests := []struct {
+		name   string
+		target string
+	}{
+		{name: "absolute", target: "/etc/passwd"},
+		{name: "escaping", target: "../../../outside"},
+		{name: "windows absolute", target: `C:\outside`},
+		{name: "windows rooted", target: `\outside`},
+		{name: "windows UNC", target: `\\server\share`},
+		{name: "backslash escape", target: `..\..\outside`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			var data bytes.Buffer
+			tw := tar.NewWriter(&data)
+			if err := tw.WriteHeader(&tar.Header{
+				Name:     "lib/link",
+				Typeflag: tar.TypeSymlink,
+				Linkname: tt.target,
+				Mode:     0o777,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := tw.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			source := filepath.Join(root, "source.tar")
+			writeFile(t, source, data.Bytes())
+			dest := filepath.Join(root, "out")
+			if err := os.Mkdir(dest, 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := extract(context.Background(), source, dest, "tar"); err == nil {
+				t.Fatal("unsafe symlink accepted")
+			}
+		})
+	}
+
+	t.Run("escape through symlink component", func(t *testing.T) {
+		root := t.TempDir()
+		var data bytes.Buffer
+		tw := tar.NewWriter(&data)
+		entries := []tar.Header{
+			{Name: "x/y/a", Typeflag: tar.TypeSymlink, Linkname: "../..", Mode: 0o777},
+			{Name: "x/y/link", Typeflag: tar.TypeSymlink, Linkname: "a/../../../outside", Mode: 0o777},
+		}
+		for _, header := range entries {
+			if err := tw.WriteHeader(&header); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := tw.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		source := filepath.Join(root, "source.tar")
+		writeFile(t, source, data.Bytes())
+		dest := filepath.Join(root, "out")
+		if err := os.Mkdir(dest, 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := extract(context.Background(), source, dest, "tar"); err == nil {
+			t.Fatal("symlink escaping through another link accepted")
+		}
+	})
+
+	t.Run("entry below symlink", func(t *testing.T) {
+		root := t.TempDir()
+		var data bytes.Buffer
+		tw := tar.NewWriter(&data)
+		entries := []tar.Header{
+			{Name: "pivot", Typeflag: tar.TypeSymlink, Linkname: "inside", Mode: 0o777},
+			{Name: "pivot/write", Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len("bad"))},
+		}
+		for _, header := range entries {
+			if err := tw.WriteHeader(&header); err != nil {
+				t.Fatal(err)
+			}
+			if header.Typeflag == tar.TypeReg {
+				if _, err := tw.Write([]byte("bad")); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		if err := tw.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		source := filepath.Join(root, "source.tar")
+		writeFile(t, source, data.Bytes())
+		dest := filepath.Join(root, "out")
+		if err := os.Mkdir(dest, 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := extract(context.Background(), source, dest, "tar"); err == nil {
+			t.Fatal("archive entry below symlink accepted")
+		}
+		if _, err := os.Lstat(filepath.Join(dest, "inside", "write")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("entry was written through symlink: %v", err)
+		}
+	})
+}
+
+func TestStripPrefixRejectsSymlinkOutsideSelectedTree(t *testing.T) {
+	root := t.TempDir()
+	var data bytes.Buffer
+	tw := tar.NewWriter(&data)
+	entries := []tar.Header{
+		{Name: "pkg/link", Typeflag: tar.TypeSymlink, Linkname: "../outside/target", Mode: 0o777},
+		{Name: "outside/target", Typeflag: tar.TypeReg, Mode: 0o644, Size: 4},
+	}
+	for _, header := range entries {
+		if err := tw.WriteHeader(&header); err != nil {
+			t.Fatal(err)
+		}
+		if header.Typeflag == tar.TypeReg {
+			if _, err := tw.Write([]byte("data")); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	tree := filepath.Join(root, "tree")
+	if err := os.Mkdir(tree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(root, "source.tar")
+	writeFile(t, source, data.Bytes())
+	if err := extract(context.Background(), source, tree, "tar"); err != nil {
+		t.Fatal(err)
+	}
+
+	selected, err := stripPrefix(tree, artifact{StripPrefix: "pkg"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := treeChecksum(context.Background(), selected); err == nil {
+		t.Fatal("symlink escaping the selected artifact accepted")
+	}
+}
+
+func TestDiscoverSkipsSymlinks(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	writeFile(t, filepath.Join(outside, manifestName), []byte("not: followed\n"))
+	if err := os.Symlink(outside, filepath.Join(root, "linked")); err != nil {
+		t.Fatal(err)
+	}
+
+	paths, err := discover(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 0 {
+		t.Fatalf("discovery followed symlink and found %v", paths)
+	}
 }
 
 func TestArchiveHintsAndArchiveDestinations(t *testing.T) {
@@ -862,6 +1617,21 @@ func archiveBytes(t *testing.T, format string, payload []byte) []byte {
 		if err := xw.Close(); err != nil {
 			t.Fatal(err)
 		}
+	case "zstd", "tar.zst":
+		zw, err := zstd.NewWriter(&data)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if format == "tar.zst" {
+			writeTar(zw, "file.txt")
+		} else {
+			zw.Write(payload)
+		}
+
+		if err := zw.Close(); err != nil {
+			t.Fatal(err)
+		}
 	default:
 		t.Fatalf("unknown test archive format %q", format)
 	}
@@ -870,7 +1640,7 @@ func archiveBytes(t *testing.T, format string, payload []byte) []byte {
 }
 
 func TestArchiveFormats(t *testing.T) {
-	for _, format := range []string{"tar", "zip", "gzip", "xz", "tar.xz"} {
+	for _, format := range []string{"tar", "zip", "gzip", "xz", "tar.xz", "zstd", "tar.zst"} {
 		t.Run(format, func(t *testing.T) {
 			payload := "uncompressed payload"
 			root := t.TempDir()
@@ -887,7 +1657,7 @@ func TestArchiveFormats(t *testing.T) {
 			}
 
 			file := "file.txt"
-			if format == "gzip" || format == "xz" {
+			if singleFile(format) {
 				file = "payload"
 			}
 

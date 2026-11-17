@@ -99,7 +99,8 @@ func treeChecksumExcept(ctx context.Context, root string, excluded []string) (st
 
 		rel, _ := filepath.Rel(root, path)
 
-		if !info.IsDir() && !info.Mode().IsRegular() {
+		isSymlink := info.Mode()&os.ModeSymlink != 0
+		if !info.IsDir() && !info.Mode().IsRegular() && !isSymlink {
 			return fmt.Errorf("unsupported file type at %s", path)
 		}
 
@@ -115,6 +116,17 @@ func treeChecksumExcept(ctx context.Context, root string, excluded []string) (st
 			if err != nil {
 				return err
 			}
+		} else if isSymlink {
+			target, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			if err := validateTreeSymlink(root, path, target); err != nil {
+				return fmt.Errorf("unsafe symlink at %s: %w", path, err)
+			}
+
+			targetSum := sha256.Sum256([]byte(target))
+			sum = hex.EncodeToString(targetSum[:])
 		}
 
 		_, err = fmt.Fprintf(h, "%q %o %s\n", filepath.ToSlash(rel), info.Mode(), sum)
@@ -166,7 +178,7 @@ func (c *cache) downloadSource(ctx context.Context, a artifact) (string, error) 
 		return "", err
 	}
 
-	object := filepath.Join(c.dir, "objects", a.SHA256)
+	object := filepath.Join(c.dir, objectsDirectoryName, a.SHA256)
 	if err := os.MkdirAll(object, 0o755); err != nil {
 		return "", err
 	}
@@ -208,7 +220,7 @@ func (c *cache) downloadSource(ctx context.Context, a artifact) (string, error) 
 // removeLegacyTrees drops only the unpacked entries owned by older versions
 // of depot. Callers hold this object's lock.
 func (c *cache) removeLegacyTrees(a artifact) error {
-	object := filepath.Join(c.dir, "objects", a.SHA256)
+	object := filepath.Join(c.dir, objectsDirectoryName, a.SHA256)
 
 	for _, format := range []string{"tar", "tar.gz", "tar.bz2", "tar.xz", "zip", "gzip", "xz"} {
 		tree := filepath.Join(object, "unpacked-"+format)
@@ -229,7 +241,7 @@ func (c *cache) removeLegacyTrees(a artifact) error {
 }
 
 func unpackedPath(tree, format string) string {
-	if format == "gzip" || format == "xz" {
+	if singleFile(format) {
 		return filepath.Join(tree, "payload")
 	}
 

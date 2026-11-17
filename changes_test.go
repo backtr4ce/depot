@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -365,4 +366,118 @@ func TestStampDetectsManifestChanges(t *testing.T) {
 	}
 
 	sync("workspace is up to date")
+}
+
+func TestParentAbsorbsFormerChildArtifact(t *testing.T) {
+	root := t.TempDir()
+	leaf := []byte("separate leaf")
+	var bundle atomic.Pointer[[]byte]
+	server := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/leaf" {
+			w.Write(leaf)
+			return
+		}
+
+		w.Write(*bundle.Load())
+	})
+	child := manifest{
+		Artifacts: []artifact{
+			{
+				Name:   "leaf",
+				To:     "bundle/leaf",
+				From:   server.URL + "/leaf",
+				SHA256: digest(leaf),
+			},
+		},
+	}
+	versions := [][]byte{
+		tarGzip(t, map[string][]byte{"DEPOT.yaml": manifestBytes(t, child)}),
+		tarGzip(t, map[string][]byte{"leaf": []byte("shipped by parent")}),
+	}
+
+	for _, data := range versions {
+		bundle.Store(&data)
+		writeManifest(t, root, manifest{
+			Artifacts: []artifact{
+				{
+					Name:   "bundle",
+					To:     "bundle",
+					From:   server.URL + "/bundle.tar.gz",
+					SHA256: digest(data),
+				},
+			},
+		})
+		configure(t, root)
+
+		if err := runCLI(t, root, "validate"); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := runCLI(t, root, "sync"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if got := readString(t, filepath.Join(root, "bundle", "leaf")); got != "shipped by parent" {
+		t.Fatalf("parent update did not take over the former child: %q", got)
+	}
+
+	saved, err := readState(filepath.Join(root, ".cache", "depot", "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := saved.Installed[filepath.Join("bundle", "leaf")]; ok || len(saved.Installed) != 1 {
+		t.Fatalf("state still records the absorbed child: %+v", saved.Installed)
+	}
+
+	// Further syncs agree with the new ownership.
+	for _, command := range []string{"validate", "sync", "clean"} {
+		if err := runCLI(t, root, command); err != nil {
+			t.Fatalf("%s: %v", command, err)
+		}
+	}
+}
+
+func TestRequiredSatisfiedByDownloadedManifest(t *testing.T) {
+	root := t.TempDir()
+	leaf := []byte("leaf")
+	server := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write(leaf)
+	})
+	child := manifest{
+		Artifacts: []artifact{
+			{
+				Name:   "leaf",
+				To:     "deps/leaf",
+				From:   server.URL + "/leaf",
+				SHA256: digest(leaf),
+			},
+		},
+	}
+	data := tarGzip(t, map[string][]byte{"DEPOT.yaml": manifestBytes(t, child)})
+	bundleServer := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write(data)
+	})
+	m := stripPrefixManifest(bundleServer.URL, data, "")
+	m.Required = []string{"leaf"}
+	writeManifest(t, root, m)
+
+	configure(t, root)
+	if err := runCLI(t, root, "sync"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runCLI(t, root, "validate"); err != nil {
+		t.Fatal(err)
+	}
+
+	// A requirement nothing in the complete graph defines still fails, and the
+	// failed sync is not recorded as complete.
+	m.Required = []string{"leaf", "missing"}
+	writeManifest(t, root, m)
+	configure(t, root)
+	wantError(t, runCLI(t, root, "sync"), "required artifacts have no active definition: missing")
+	wantError(t, runCLI(t, root, "validate"), "missing")
+	wantError(t, runCLI(t, root, "sync"), "missing")
 }

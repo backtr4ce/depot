@@ -11,8 +11,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"syscall"
+
+	"golang.org/x/sync/errgroup"
 )
 
 type installation struct {
@@ -106,10 +107,6 @@ func (e *engine) sync(ctx context.Context, vars map[string]any) error {
 			return err
 		}
 
-		if err := g.checkRequired(); err != nil {
-			return err
-		}
-
 		if missing := missingChecksums(batch); len(missing) > 0 {
 			return fmt.Errorf("refusing to download artifacts without a sha256 checksum: %s", strings.Join(missing, ", "))
 		}
@@ -147,6 +144,8 @@ func (e *engine) sync(ctx context.Context, vars map[string]any) error {
 		}
 	}
 
+	// Only the complete graph can satisfy required: downloaded manifests may
+	// define the required artifacts.
 	if err := g.checkRequired(); err != nil {
 		return err
 	}
@@ -219,51 +218,30 @@ func (e *engine) upToDate(ctx context.Context, vars map[string]any) (bool, error
 	return true, nil
 }
 
+// prepare downloads and extracts a batch concurrently. The first failure
+// cancels the remaining work.
 func (e *engine) prepare(ctx context.Context, batch []artifact, stage string) ([]string, error) {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
 	sources := make([]string, len(batch))
-	workers := min(e.jobs, len(batch))
-	work := make(chan int)
-	var wg sync.WaitGroup
-	var once sync.Once
-	var failure error
-	for range workers {
-		wg.Go(func() {
-			for i := range work {
-				source, err := e.prepareArtifact(ctx, batch[i], stage)
-				if err != nil {
-					once.Do(func() {
-						failure = fmt.Errorf("artifact %q: %w", batch[i].Name, err)
-						cancel()
-					})
+	group, ctx := errgroup.WithContext(ctx)
+	group.SetLimit(e.jobs)
 
-					return
-				}
-
-				sources[i] = source
+	for i, a := range batch {
+		group.Go(func() error {
+			source, err := e.prepareArtifact(ctx, a, stage)
+			if err != nil {
+				return fmt.Errorf("artifact %q: %w", a.Name, err)
 			}
+
+			sources[i] = source
+			return nil
 		})
 	}
 
-send:
-	for i := range batch {
-		select {
-		case work <- i:
-		case <-ctx.Done():
-			break send
-		}
+	if err := group.Wait(); err != nil {
+		return nil, err
 	}
 
-	close(work)
-	wg.Wait()
-
-	if failure != nil {
-		return nil, failure
-	}
-
-	return sources, ctx.Err()
+	return sources, nil
 }
 
 // prepareArtifact skips verified current installations. Otherwise it downloads
@@ -360,6 +338,19 @@ func (e *engine) checkRecorded(ctx context.Context, dest string) error {
 	return nil
 }
 
+// nestedRecords returns the records of artifacts installed below dest.
+func (e *engine) nestedRecords(dest string) map[string]installation {
+	nested := map[string]installation{}
+	for path, record := range e.state.Installed {
+		child := filepath.Join(e.root, path)
+		if child != dest && within(dest, child) {
+			nested[path] = record
+		}
+	}
+
+	return nested
+}
+
 func copyTree(ctx context.Context, source, dest string) error {
 	return filepath.WalkDir(source, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
@@ -383,6 +374,18 @@ func copyTree(ctx context.Context, source, dest string) error {
 
 		if info.IsDir() {
 			return os.Mkdir(target, info.Mode().Perm())
+		}
+
+		if info.Mode()&os.ModeSymlink != 0 {
+			linkTarget, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			if err := validateTreeSymlink(source, path, linkTarget); err != nil {
+				return fmt.Errorf("unsafe symlink at %s: %w", path, err)
+			}
+
+			return os.Symlink(linkTarget, target)
 		}
 
 		if !info.Mode().IsRegular() {
@@ -409,6 +412,40 @@ func copyTree(ctx context.Context, source, dest string) error {
 	})
 }
 
+// stagePayload places source at payload next to the destination. Extracted
+// trees belong to this sync and are moved; a rename keeps every byte that was
+// hashed. Cached raw files, and trees on another file system, are copied and
+// hashed again.
+func (e *engine) stagePayload(ctx context.Context, a artifact, source, payload, sum string) error {
+	if installedFormat(a) != "none" {
+		err := os.Rename(source, payload)
+		if err == nil {
+			return nil
+		}
+
+		if !errors.Is(err, syscall.EXDEV) {
+			return err
+		}
+
+		e.log.Debug("staging is on another file system; copying", "artifact", a.Name)
+	}
+
+	if err := copyTree(ctx, source, payload); err != nil {
+		return err
+	}
+
+	copied, err := treeChecksum(ctx, payload)
+	if err != nil {
+		return err
+	}
+
+	if copied != sum {
+		return fmt.Errorf("staged artifact failed integrity verification")
+	}
+
+	return nil
+}
+
 func (e *engine) install(ctx context.Context, a artifact, source string) error {
 	if err := e.checkDestination(ctx, a); err != nil {
 		return err
@@ -420,18 +457,6 @@ func (e *engine) install(ctx context.Context, a artifact, source string) error {
 	}
 
 	rel, _ := filepath.Rel(e.root, a.dest)
-
-	for path := range e.state.Installed {
-		child := filepath.Join(e.root, path)
-		if child != a.dest && within(a.dest, child) {
-			nested, _ := filepath.Rel(a.dest, child)
-			if _, err := os.Lstat(filepath.Join(source, nested)); err == nil {
-				return fmt.Errorf("parent archive contains managed child destination %s", path)
-			} else if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ENOTDIR) {
-				return err
-			}
-		}
-	}
 
 	old, hadOld := e.state.Installed[rel]
 	if old.current(a) && old.Tree == sum {
@@ -457,17 +482,8 @@ func (e *engine) install(ctx context.Context, a artifact, source string) error {
 	}()
 
 	payload := filepath.Join(stage, "payload")
-	if err := copyTree(ctx, source, payload); err != nil {
+	if err := e.stagePayload(ctx, a, source, payload, sum); err != nil {
 		return err
-	}
-
-	copied, err := treeChecksum(ctx, payload)
-	if err != nil {
-		return err
-	}
-
-	if copied != sum {
-		return fmt.Errorf("staged artifact failed integrity verification")
 	}
 
 	if err := e.checkDestination(ctx, a); err != nil {
@@ -508,6 +524,14 @@ func (e *engine) install(ctx context.Context, a artifact, source string) error {
 		return rollback(err, false)
 	}
 
+	// Nested artifacts were inside the replaced tree, so the new parent owns
+	// their paths. Those still declared by the new manifests are reinstalled
+	// once the batch below the parent is discovered.
+	children := e.nestedRecords(a.dest)
+	for path := range children {
+		delete(e.state.Installed, path)
+	}
+
 	e.state.Installed[rel] = installation{
 		SHA256:      a.SHA256,
 		StripPrefix: a.StripPrefix,
@@ -520,6 +544,10 @@ func (e *engine) install(ctx context.Context, a artifact, source string) error {
 			e.state.Installed[rel] = old
 		} else {
 			delete(e.state.Installed, rel)
+		}
+
+		for path, record := range children {
+			e.state.Installed[path] = record
 		}
 
 		return rollback(err, true)

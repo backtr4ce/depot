@@ -23,6 +23,14 @@ const (
 	maxJobs = 256
 
 	maxRedirects = 10
+
+	cacheDirectoryName    = ".cache"
+	gitDirectoryName      = ".git"
+	depotDirectoryName    = "depot"
+	objectsDirectoryName  = "objects"
+	stateFileName         = "state.json"
+	workspaceLockFileName = "workspace.lock"
+	cacheIgnoreFileName   = ".gitignore"
 )
 
 func main() {
@@ -193,7 +201,7 @@ func run(
 			return err
 		}
 
-		l, err := lock(cmd.Context(), filepath.Join(s.cacheDir, "workspace.lock"))
+		l, err := lock(cmd.Context(), filepath.Join(s.cacheDir, workspaceLockFileName))
 		if err != nil {
 			return err
 		}
@@ -268,11 +276,11 @@ func (s *session) openWorkspace(create bool) error {
 		return err
 	}
 
-	s.cacheDir = filepath.Join(workspace, ".cache", "depot")
-	s.statePath = filepath.Join(s.cacheDir, "state.json")
+	s.cacheDir = filepath.Join(workspace, cacheDirectoryName, depotDirectoryName)
+	s.statePath = filepath.Join(s.cacheDir, stateFileName)
 	dirs := []string{
 		s.cacheDir,
-		filepath.Join(s.cacheDir, "objects"),
+		filepath.Join(s.cacheDir, objectsDirectoryName),
 	}
 
 	for _, dir := range dirs {
@@ -289,7 +297,7 @@ func (s *session) openWorkspace(create bool) error {
 		}
 	}
 
-	for _, path := range []string{filepath.Join(s.cacheDir, "workspace.lock"), s.statePath} {
+	for _, path := range []string{filepath.Join(s.cacheDir, workspaceLockFileName), s.statePath} {
 		if err := noSymlinks(workspace, path); err != nil {
 			return err
 		}
@@ -311,7 +319,7 @@ func (s *session) ignoreCache() error {
 		return err
 	}
 
-	path := filepath.Join(s.cacheDir, ".gitignore")
+	path := filepath.Join(s.cacheDir, cacheIgnoreFileName)
 	if err := noSymlinks(s.root, path); err != nil {
 		return err
 	}
@@ -332,7 +340,7 @@ func (s *session) ignoreCache() error {
 // removeLegacyIgnore deletes the .cache/.gitignore written by earlier depot
 // versions, but only if nobody changed it.
 func (s *session) removeLegacyIgnore() error {
-	path := filepath.Join(s.root, ".cache", ".gitignore")
+	path := filepath.Join(s.root, cacheDirectoryName, cacheIgnoreFileName)
 	if err := noSymlinks(s.root, path); err != nil {
 		return err
 	}
@@ -391,8 +399,15 @@ func runConfigure(_ context.Context, s *session) error {
 			"artifact", name)
 	}
 
+	// configure does not read manifests shipped inside artifacts, which may
+	// define required artifacts; sync checks the complete graph.
 	if err := g.checkRequired(); err != nil {
-		return err
+		if !mayShipManifests(active) {
+			return err
+		}
+
+		s.log.Warn("required artifacts are not defined yet; sync fails unless downloaded manifests define them",
+			"error", err)
 	}
 
 	if err := atomicJSON(s.statePath, s.state); err != nil {
@@ -403,6 +418,16 @@ func runConfigure(_ context.Context, s *session) error {
 		"variables", len(s.state.Variables),
 		"artifacts", len(g.names))
 	return nil
+}
+
+func mayShipManifests(active []artifact) bool {
+	for _, a := range active {
+		if !a.IgnoreDepot {
+			return true
+		}
+	}
+
+	return false
 }
 
 // runValidate never touches the network, so the engine has no HTTP client.

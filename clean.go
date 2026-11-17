@@ -35,7 +35,7 @@ func runClean(ctx context.Context, s *session) error {
 		destinations = append(destinations, dest)
 	}
 
-	objects := filepath.Join(s.cacheDir, "objects")
+	objects := filepath.Join(s.cacheDir, objectsDirectoryName)
 	if err := noSymlinks(s.root, objects); err != nil {
 		return err
 	}

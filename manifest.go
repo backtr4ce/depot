@@ -104,6 +104,29 @@ func within(root, path string) bool {
 	return err == nil && filepath.IsLocal(rel)
 }
 
+// slashPath interprets both portable and Windows separators in manifest and
+// archive paths, independently of the host operating system.
+func slashPath(path string) string {
+	return strings.ReplaceAll(path, "\\", "/")
+}
+
+func manifestWorkspacePath(root, path string) (string, error) {
+	normalized := slashPath(path)
+	if strings.ContainsRune(normalized, 0) || len(normalized) >= 2 && normalized[1] == ':' {
+		return "", fmt.Errorf("path %q must be relative and cannot escape the workspace root", path)
+	}
+
+	return workspacePath(root, filepath.FromSlash(normalized))
+}
+
+func reservedWorkspaceDir(name string) bool {
+	if filepath.Separator == '\\' {
+		return strings.EqualFold(name, gitDirectoryName) || strings.EqualFold(name, cacheDirectoryName)
+	}
+
+	return name == gitDirectoryName || name == cacheDirectoryName
+}
+
 func workspacePath(root, path string) (string, error) {
 	if !filepath.IsLocal(path) {
 		return "", fmt.Errorf("path %q must be relative and cannot escape the workspace root", path)
@@ -117,7 +140,7 @@ func workspacePath(root, path string) (string, error) {
 	rel, _ := filepath.Rel(root, full)
 
 	for _, part := range strings.Split(rel, string(filepath.Separator)) {
-		if part == ".git" || part == ".cache" {
+		if reservedWorkspaceDir(part) {
 			return "", fmt.Errorf("path %q uses a reserved directory", path)
 		}
 	}
@@ -328,7 +351,7 @@ func (g *graph) load(paths []string) ([]artifact, error) {
 		}
 
 		for _, include := range m.Includes {
-			dir, err := workspacePath(g.root, include)
+			dir, err := manifestWorkspacePath(g.root, include)
 			if err != nil {
 				return nil, fmt.Errorf("%s: include: %w", path, err)
 			}
@@ -399,7 +422,7 @@ func (g *graph) add(a *artifact, path string) error {
 		return fail("from must be an HTTP(S) URL without credentials or a fragment")
 	}
 
-	a.dest, err = workspacePath(g.root, a.To)
+	a.dest, err = manifestWorkspacePath(g.root, a.To)
 	if err != nil {
 		return fail("%s", err)
 	}
@@ -491,12 +514,13 @@ func discover(dir string) ([]string, error) {
 			return err
 		}
 
-		if entry.IsDir() && (entry.Name() == ".git" || entry.Name() == ".cache") {
+		if entry.IsDir() && reservedWorkspaceDir(entry.Name()) {
 			return filepath.SkipDir
 		}
 
 		if entry.Type()&os.ModeSymlink != 0 {
-			return fmt.Errorf("refusing symlink during manifest discovery: %s", path)
+			// WalkDir does not follow links; linked manifests are not inputs.
+			return nil
 		}
 
 		if !entry.IsDir() && entry.Name() == manifestName {

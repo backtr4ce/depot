@@ -55,10 +55,6 @@ func (e *engine) validate(ctx context.Context, vars map[string]any) error {
 			return err
 		}
 
-		if err := g.checkRequired(); err != nil {
-			problems = append(problems, err)
-		}
-
 		probes, err := e.probeAll(ctx, batch)
 		if err != nil {
 			return err
@@ -95,6 +91,15 @@ func (e *engine) validate(ctx context.Context, vars map[string]any) error {
 
 			g.inherit(a.dest, found, a.defaults)
 			paths = append(paths, found...)
+		}
+	}
+
+	if err := g.checkRequired(); err != nil {
+		if deferred > 0 {
+			e.log.Warn("required artifacts may be defined by manifests that are not installed yet",
+				"error", err)
+		} else {
+			problems = append(problems, err)
 		}
 	}
 
@@ -182,7 +187,7 @@ func (e *engine) probe(ctx context.Context, a artifact) (probe, error) {
 
 // has checks the original download without taking locks or repairing the cache.
 func (c *cache) has(ctx context.Context, a artifact) (bool, error) {
-	object := filepath.Join(c.dir, "objects", a.SHA256)
+	object := filepath.Join(c.dir, objectsDirectoryName, a.SHA256)
 	if err := noSymlinks(c.dir, object); err != nil {
 		return false, err
 	}

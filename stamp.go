@@ -15,7 +15,7 @@ import (
 
 // stampVersion changes whenever evaluation semantics change, so that state
 // written by an older depot is never trusted.
-const stampVersion = 1
+const stampVersion = 3
 
 // stamp records every input of a completed sync, like the stamp files of
 // ninja and GN. While the stamp matches the workspace, state.json describes
